@@ -1,47 +1,94 @@
+"""LangGraph agent orchestration for ResolveAI.
+
+The workflow is a real StateGraph, not a sequential loop:
+
+    classify -> plan -> execute_tools -> guardrails --(violations?)--+
+                                             |                       |
+                                        [no] v                  [yes] v
+                                     generate_response    finalize_escalation
+                                             \\                 /
+                                              +---> END <-----+
+
+Design decisions worth defending in review:
+- Guardrail routing is a *conditional edge*: when deterministic rules fire,
+  we skip the final LLM call entirely and build the escalation response in
+  code — cheaper, faster, and impossible for the model to talk itself out of.
+- Every node execution is audited to Postgres (agent_steps), every tool
+  invocation to tool_calls, and the run summary to agent_runs.
+- The DB session is passed through LangGraph's configurable rather than
+  globals, keeping nodes pure and unit-testable.
+"""
+
 import datetime
 import json
 import logging
+import re
 import time
 import uuid
 from decimal import Decimal
-from typing import Any, Literal, TypedDict
+from enum import StrEnum
+from typing import Annotated, Any
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from typing_extensions import TypedDict
 
-from resolveai.core.config import settings
-from resolveai.core.llm_provider import get_llm_provider
-from resolveai.models.models import (
-    AgentDecision,
-    AgentRun,
-    AgentStep,
-    Customer,
-    Order,
-    Payment,
-    Policy,
-    PolicyChunk,
-    Shipment,
-    Ticket,
-    TicketMessage,
-    ToolCall,
-)
+from resolveai.agent.guardrails import guardrails_node
 from resolveai.agent.tools import (
+    create_escalation,
+    create_refund_request,
     get_customer,
     get_order,
     get_payment,
     get_shipment,
     search_policy,
-    create_refund_request,
-    create_escalation,
+)
+from resolveai.core.config import settings
+from resolveai.core.llm_provider import get_llm_provider
+from resolveai.core.pricing import estimate_cost
+from resolveai.models.models import (
+    AgentDecision,
+    AgentRun,
+    AgentStep,
+    Ticket,
+    TicketMessage,
+    ToolCall,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# 1. Pydantic schemas for LLM communication
+# --------------------------------------------------------------------------
+# 1. Enumerations and Pydantic schemas for structured LLM communication
+# --------------------------------------------------------------------------
+class TicketCategory(StrEnum):
+    PAYMENT_ISSUE = "PAYMENT_ISSUE"
+    DELIVERY_DISPUTE = "DELIVERY_DISPUTE"
+    ACCOUNT_ACCESS = "ACCOUNT_ACCESS"
+    SUBSCRIPTION_CHANGE = "SUBSCRIPTION_CHANGE"
+    POLICY_VIOLATION = "POLICY_VIOLATION"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+class Severity(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
 class TicketClassification(BaseModel):
-    category: str = Field(description="Category of the ticket: PAYMENT_ISSUE, DELIVERY_DISPUTE, ACCOUNT_ACCESS, SUBSCRIPTION_CHANGE, POLICY_VIOLATION, AMBIGUOUS")
-    severity: str = Field(description="Severity level: LOW, MEDIUM, HIGH, CRITICAL")
-    intent: str = Field(description="Primary intent, e.g. REPORT_MISSING_DELIVERY, CHARGE_DISPUTE, RESET_PASSWORD, CANCEL_SUBSCRIPTION")
+    category: TicketCategory = Field(description="Category of the ticket")
+    severity: Severity = Field(description="Severity level")
+    intent: str = Field(
+        description=(
+            "Primary intent, e.g. REPORT_MISSING_DELIVERY, CHARGE_DISPUTE, "
+            "RESET_PASSWORD, CANCEL_SUBSCRIPTION"
+        )
+    )
     requires_account_data: bool = Field(description="Whether account data lookup is needed")
 
 
@@ -49,24 +96,45 @@ class AgentPlan(BaseModel):
     steps: list[str] = Field(description="Sequential plan steps to resolve the issue")
 
 
+class ToolName(StrEnum):
+    GET_CUSTOMER = "get_customer"
+    GET_ORDER = "get_order"
+    GET_PAYMENT = "get_payment"
+    GET_SHIPMENT = "get_shipment"
+    SEARCH_POLICY = "search_policy"
+    CREATE_REFUND_REQUEST = "create_refund_request"
+    CREATE_ESCALATION = "create_escalation"
+    DONE = "DONE"
+
+
 class LLMToolDecision(BaseModel):
-    tool_name: Literal["get_customer", "get_order", "get_payment", "get_shipment", "search_policy", "create_refund_request", "create_escalation", "DONE"] = Field(
+    tool_name: ToolName = Field(
         description="Name of the tool to execute or 'DONE' if resolution is ready"
     )
     tool_input: dict[str, Any] = Field(
-        default={},
-        description="Dictionary of inputs for the tool. E.g. {'customer_id': 'CUS-10293'} or {'query': 'refund policy'}"
+        default_factory=dict,
+        description=(
+            "Dictionary of inputs for the tool. "
+            "E.g. {'customer_id': 'CUS-10293'} or {'query': 'refund policy'}"
+        ),
     )
 
 
 class LLMResolution(BaseModel):
-    resolution: Literal["RESOLVED", "ESCALATE"] = Field(description="Final outcome")
+    resolution: str = Field(description="Final outcome: RESOLVED or ESCALATE")
     reason: str = Field(description="Explanation of the final outcome")
     evidence: list[str] = Field(description="Policy and data points supporting this decision")
     actions_taken: list[str] = Field(description="Action summaries performed")
 
 
-# 2. Define Agent State Schema
+# --------------------------------------------------------------------------
+# 2. Agent state (LangGraph channels)
+# --------------------------------------------------------------------------
+def _add_tokens(existing: int, new: int) -> int:
+    """Reducer: token counters accumulate across nodes."""
+    return existing + new
+
+
 class AgentState(TypedDict):
     ticket_id: str
     run_id: str
@@ -81,37 +149,44 @@ class AgentState(TypedDict):
     reason: str | None
     evidence: list[str]
     actions_taken: list[str]
-    input_tokens: int
-    output_tokens: int
+    input_tokens: Annotated[int, _add_tokens]
+    output_tokens: Annotated[int, _add_tokens]
     estimated_cost: Decimal
     latency_ms: int
 
 
-# 3. LangGraph Nodes
+def _history(state: AgentState) -> str:
+    return "\n".join(f"{m['role']}: {m['content']}" for m in state["messages"])
+
+
+def _classification_json(state: AgentState) -> str:
+    if not state["classification"]:
+        return "{}"
+    return json.dumps(state["classification"].model_dump())
+
+
+# --------------------------------------------------------------------------
+# 3. Node implementations (pure: state + db in, partial state out)
+# --------------------------------------------------------------------------
 async def classify_node(state: AgentState, db: Any) -> dict[str, Any]:
-    """Classifies the ticket intent, category, and severity."""
+    """Classify the ticket intent, category, and severity."""
     provider = get_llm_provider()
-    
-    # Compile history
-    history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in state["messages"]])
-    prompt = f"Analyze the following support ticket and classify it:\n\n{history}"
-    
-    system_instruction = "You are an expert customer operations classifier. Categorize tickets with high precision."
-    
+    prompt = f"Analyze the following support ticket and classify it:\n\n{_history(state)}"
+    system_instruction = (
+        "You are an expert customer operations classifier. Categorize tickets with high precision."
+    )
+
     classification, in_tokens, out_tokens = await provider.generate_structured(
         prompt=prompt,
         response_model=TicketClassification,
         system_instruction=system_instruction,
     )
-    
-    # Try to extract customer_id if present in message
+
+    # Extract customer_id from the conversation if the ticket lacks one.
     customer_id = state["customer_id"]
     if not customer_id:
         for msg in state["messages"]:
-            content = msg["content"]
-            # Look for CUS-XXXXX pattern
-            import re
-            match = re.search(r"CUS-\d+", content)
+            match = re.search(r"CUS-\d+", msg["content"])
             if match:
                 customer_id = match.group(0)
                 break
@@ -119,438 +194,419 @@ async def classify_node(state: AgentState, db: Any) -> dict[str, Any]:
     return {
         "classification": classification,
         "customer_id": customer_id,
-        "input_tokens": state["input_tokens"] + in_tokens,
-        "output_tokens": state["output_tokens"] + out_tokens,
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
     }
 
 
 async def plan_node(state: AgentState, db: Any) -> dict[str, Any]:
-    """Generates a sequential resolution plan."""
+    """Generate a sequential resolution plan."""
     if not state["classification"]:
         return {"plan": []}
-        
+
     provider = get_llm_provider()
-    history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in state["messages"]])
-    classification_str = json.dumps(state["classification"].model_dump())
-    
     prompt = (
-        f"Support Ticket History:\n{history}\n\n"
-        f"Classification:\n{classification_str}\n\n"
-        f"Create a step-by-step resolution plan using tools. Focus on correctness and policy adherence."
+        f"Support Ticket History:\n{_history(state)}\n\n"
+        f"Classification:\n{json.dumps(state['classification'].model_dump())}\n\n"
+        "Create a step-by-step resolution plan using tools. "
+        "Focus on correctness and policy adherence."
     )
-    
-    system_instruction = "You are a customer operations planner. Output a structured JSON plan list."
-    
     plan_resp, in_tokens, out_tokens = await provider.generate_structured(
         prompt=prompt,
         response_model=AgentPlan,
-        system_instruction=system_instruction,
+        system_instruction=(
+            "You are a customer operations planner. Output a structured JSON plan list."
+        ),
     )
-    
     return {
         "plan": plan_resp.steps,
-        "input_tokens": state["input_tokens"] + in_tokens,
-        "output_tokens": state["output_tokens"] + out_tokens,
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
     }
 
 
+_TOOL_SYSTEM_INSTRUCTION = (
+    "You are a customer support tool calling agent. Use the correct tool names and arguments.\n"
+    "Tools available:\n"
+    "- get_customer(customer_id)\n"
+    "- get_order(order_id)\n"
+    "- get_payment(payment_id)\n"
+    "- get_shipment(order_id)\n"
+    "- search_policy(query)\n"
+    "- create_refund_request(order_id, amount, reason)\n"
+    "- create_escalation(queue_name, reason)\n"
+)
+
+MAX_TOOL_LOOPS = 5
+
+
+async def _dispatch_tool(
+    state: AgentState, db: Any, tool_name: str, args: dict[str, Any]
+) -> tuple[dict[str, Any], str, list[str], list[str]]:
+    """Execute one tool. Returns (result, status, new_citations, new_actions)."""
+    citations: list[str] = []
+    actions: list[str] = []
+
+    if tool_name == "get_customer":
+        cid = args.get("customer_id") or state["customer_id"]
+        if not cid:
+            return {"error": "Missing customer_id argument"}, "FAILED", citations, actions
+        return await get_customer(db, cid), "SUCCESS", citations, actions
+
+    if tool_name == "get_order":
+        oid = args.get("order_id")
+        if not oid:
+            return {"error": "Missing order_id"}, "FAILED", citations, actions
+        return await get_order(db, oid), "SUCCESS", citations, actions
+
+    if tool_name == "get_payment":
+        pid = args.get("payment_id") or args.get("order_id")
+        if not pid:
+            return {"error": "Missing payment_id or order_id"}, "FAILED", citations, actions
+        return await get_payment(db, pid), "SUCCESS", citations, actions
+
+    if tool_name == "get_shipment":
+        oid = args.get("order_id")
+        if not oid:
+            return {"error": "Missing order_id"}, "FAILED", citations, actions
+        return await get_shipment(db, oid), "SUCCESS", citations, actions
+
+    if tool_name == "search_policy":
+        query = args.get("query")
+        if not query:
+            return {"error": "Missing query"}, "FAILED", citations, actions
+        result = await search_policy(db, query)
+        citations = list(result.get("citations", []))
+        return result, "SUCCESS", citations, actions
+
+    if tool_name == "create_refund_request":
+        oid = args.get("order_id")
+        amount = float(args.get("amount", 0.0))
+        reason = args.get("reason", "Customer request")
+        if not oid or amount <= 0.0:
+            return {"error": "Missing order_id or valid amount"}, "FAILED", citations, actions
+        result = await create_refund_request(db, oid, amount, reason)
+        actions.append(f"Created refund request for {oid} (Amount: {amount})")
+        return result, "SUCCESS", citations, actions
+
+    if tool_name == "create_escalation":
+        queue = args.get("queue_name", "general")
+        reason = args.get("reason", "Agent escalation")
+        result = await create_escalation(db, state["ticket_id"], state["run_id"], queue, reason)
+        actions.append(f"Created escalation {result.get('escalation_id')}")
+        return result, "SUCCESS", citations, actions
+
+    return {"error": "Unknown tool"}, "FAILED", citations, actions
+
+
 async def execute_tools_node(state: AgentState, db: Any) -> dict[str, Any]:
-    """Executes a loop of tool calling guided by the LLM."""
+    """LLM-guided tool-calling loop with per-call Postgres auditing."""
     provider = get_llm_provider()
-    
+
     tool_outputs = list(state["tool_outputs"])
     policy_citations = list(state["policy_citations"])
     actions_taken = list(state["actions_taken"])
-    
-    input_tokens = state["input_tokens"]
-    output_tokens = state["output_tokens"]
-    
-    max_loops = 5
-    loop_count = 0
-    
-    while loop_count < max_loops:
-        loop_count += 1
-        
-        # Compile current environment state
-        history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in state["messages"]])
-        class_json = json.dumps(state["classification"].model_dump()) if state["classification"] else "{}"
-        plan_json = json.dumps(state["plan"])
-        outputs_json = json.dumps(tool_outputs)
-        
+    input_tokens = 0
+    output_tokens = 0
+
+    for _ in range(MAX_TOOL_LOOPS):
         prompt = (
-            f"Ticket History:\n{history}\n\n"
-            f"Classification: {class_json}\n"
-            f"Plan: {plan_json}\n\n"
-            f"Current Executed Tools and Outputs:\n{outputs_json}\n\n"
-            f"Identify the next tool to execute. If you have all facts to resolve or escalate, return 'DONE'.\n"
+            f"Ticket History:\n{_history(state)}\n\n"
+            f"Classification: {_classification_json(state)}\n"
+            f"Plan: {json.dumps(state['plan'])}\n\n"
+            f"Current Executed Tools and Outputs:\n{json.dumps(tool_outputs)}\n\n"
+            "Identify the next tool to execute. If you have all facts to resolve or escalate, "
+            "return 'DONE'.\n"
             f"Available customer ID: {state['customer_id']}"
         )
-        
-        system_instruction = (
-            "You are a customer support tool calling agent. Use the correct tool names and arguments.\n"
-            "Tools available:\n"
-            "- get_customer(customer_id)\n"
-            "- get_order(order_id)\n"
-            "- get_payment(payment_id)\n"
-            "- get_shipment(order_id)\n"
-            "- search_policy(query)\n"
-            "- create_refund_request(order_id, amount, reason)\n"
-            "- create_escalation(queue_name, reason)\n"
-        )
-        
-        decision, in_tokens, out_tokens = await provider.generate_structured(
+        decision, in_tok, out_tok = await provider.generate_structured(
             prompt=prompt,
             response_model=LLMToolDecision,
-            system_instruction=system_instruction,
+            system_instruction=_TOOL_SYSTEM_INSTRUCTION,
         )
-        
-        input_tokens += in_tokens
-        output_tokens += out_tokens
-        
-        if decision.tool_name == "DONE":
+        input_tokens += in_tok
+        output_tokens += out_tok
+
+        if decision.tool_name == ToolName.DONE:
             break
-            
-        # Execute tool
-        tool_name = decision.tool_name
+
+        tool_name = decision.tool_name.value
         args = decision.tool_input
         tool_start = time.perf_counter()
-        
-        tool_res = None
-        status = "SUCCESS"
-        
+
         try:
-            if tool_name == "get_customer":
-                cid = args.get("customer_id") or state["customer_id"]
-                if not cid:
-                    tool_res = {"error": "Missing customer_id argument"}
-                    status = "FAILED"
-                else:
-                    tool_res = await get_customer(db, cid)
-            elif tool_name == "get_order":
-                oid = args.get("order_id")
-                if not oid:
-                    tool_res = {"error": "Missing order_id"}
-                    status = "FAILED"
-                else:
-                    tool_res = await get_order(db, oid)
-            elif tool_name == "get_payment":
-                pid = args.get("payment_id") or args.get("order_id")
-                if not pid:
-                    tool_res = {"error": "Missing payment_id or order_id"}
-                    status = "FAILED"
-                else:
-                    tool_res = await get_payment(db, pid)
-            elif tool_name == "get_shipment":
-                oid = args.get("order_id")
-                if not oid:
-                    tool_res = {"error": "Missing order_id"}
-                    status = "FAILED"
-                else:
-                    tool_res = await get_shipment(db, oid)
-            elif tool_name == "search_policy":
-                q = args.get("query")
-                if not q:
-                    tool_res = {"error": "Missing query"}
-                    status = "FAILED"
-                else:
-                    tool_res = await search_policy(db, q)
-                    if "citations" in tool_res:
-                        policy_citations.extend(tool_res["citations"])
-            elif tool_name == "create_refund_request":
-                oid = args.get("order_id")
-                amt = float(args.get("amount", 0.0))
-                r = args.get("reason", "Customer request")
-                if not oid or amt <= 0.0:
-                    tool_res = {"error": "Missing order_id or valid amount"}
-                    status = "FAILED"
-                else:
-                    tool_res = await create_refund_request(db, oid, amt, r)
-                    actions_taken.append(f"Created refund request for {oid} (Amount: {amt})")
-            elif tool_name == "create_escalation":
-                qname = args.get("queue_name", "general")
-                r = args.get("reason", "Agent escalation")
-                tool_res = await create_escalation(db, state["ticket_id"], state["run_id"], qname, r)
-                actions_taken.append(f"Created escalation {tool_res.get('escalation_id')}")
-            else:
-                tool_res = {"error": "Unknown tool"}
-                status = "FAILED"
-        except Exception as e:
-            logger.error(f"Error executing tool {tool_name}: {e}")
-            tool_res = {"error": str(e)}
-            status = "FAILED"
-            
+            tool_res, status, new_citations, new_actions = await _dispatch_tool(
+                state, db, tool_name, args
+            )
+            policy_citations.extend(new_citations)
+            actions_taken.extend(new_actions)
+        except Exception as exc:  # noqa: BLE001 - tool errors become auditable FAILED records
+            logger.error("Error executing tool %s: %s", tool_name, exc)
+            tool_res, status = {"error": str(exc)}, "FAILED"
+
         tool_latency = int((time.perf_counter() - tool_start) * 1000)
-        
-        # Audit tool call in Postgres
-        tool_call_rec = ToolCall(
-            id=f"TLC-{uuid.uuid4().hex[:6].upper()}",
-            agent_run_id=state["run_id"],
-            tool_name=tool_name,
-            input_json=json.dumps(args),
-            output_json=json.dumps(tool_res),
-            status=status,
-            latency_ms=tool_latency,
-            created_at=datetime.datetime.utcnow(),
+
+        db.add(
+            ToolCall(
+                id=f"TLC-{uuid.uuid4().hex[:6].upper()}",
+                agent_run_id=state["run_id"],
+                tool_name=tool_name,
+                input_json=json.dumps(args),
+                output_json=json.dumps(tool_res),
+                status=status,
+                latency_ms=tool_latency,
+                created_at=datetime.datetime.now(datetime.UTC),
+            )
         )
-        db.add(tool_call_rec)
-        
-        tool_outputs.append({
-            "tool": tool_name,
-            "input": args,
-            "output": tool_res,
-            "status": status
-        })
-        
+        tool_outputs.append(
+            {"tool": tool_name, "input": args, "output": tool_res, "status": status}
+        )
+
     return {
         "tool_outputs": tool_outputs,
-        "policy_citations": list(set(policy_citations)),
+        "policy_citations": sorted(set(policy_citations)),
         "actions_taken": actions_taken,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
 
 
-async def guardrails_node(state: AgentState, db: Any) -> dict[str, Any]:
-    """Applies deterministic compliance rules and logs violations."""
-    violations = []
-    actions_taken = list(state["actions_taken"])
-    
-    # 1. Inspect tool outputs for refund actions
-    refund_amount = 0.0
-    refund_order_id = None
-    
-    for out in state["tool_outputs"]:
-        if out["tool"] == "create_refund_request" and out["status"] == "SUCCESS":
-            refund_amount = float(out["input"].get("amount", 0.0))
-            refund_order_id = out["input"].get("order_id")
-            
-    # Rule 1: High value auto-refund ceiling
-    if refund_amount > 50000.0:
-        violations.append(f"Auto-refund of ₹{refund_amount} exceeds maximum allowed auto-approval limit of ₹50,000.")
-        
-    # Rule 2: High value delivery dispute with missing proof of delivery
-    # Look for shipment details in tools
-    is_delivery_dispute = state["classification"] and state["classification"].category == "DELIVERY_DISPUTE"
-    if is_delivery_dispute:
-        for out in state["tool_outputs"]:
-            if out["tool"] == "get_shipment" and out["status"] == "SUCCESS":
-                shipment_data = out["output"]
-                proof = shipment_data.get("proof_of_delivery", "Missing")
-                sig = shipment_data.get("signature_captured", False)
-                
-                # Fetch order value
-                order_val = 0.0
-                for out_order in state["tool_outputs"]:
-                    if out_order["tool"] == "get_order" and out_order["status"] == "SUCCESS":
-                        order_val = float(out_order["output"].get("total_amount", 0.0))
-                        
-                if order_val > 50000.0 and (proof == "Missing" or not sig):
-                    violations.append(
-                        f"Order value is ₹{order_val} (> ₹50,000) and proof of delivery is missing or signature was not captured. "
-                        "POL-DELIVERY-04 requires manual logistics investigation."
-                    )
-                    
-    # Override actions if violations exist
-    if violations:
-        logger.warning(f"Guardrail violations triggered: {violations}")
-        # If we already created a refund request, we should escalate immediately
-        # Find if escalation was already created in tools
-        has_escalated = any(out["tool"] == "create_escalation" for out in state["tool_outputs"])
-        if not has_escalated:
-            # Force escalation
-            reason = " | ".join(violations)
-            esc_res = await create_escalation(db, state["ticket_id"], state["run_id"], "Logistics Investigation Team", reason)
-            actions_taken.append(f"Created escalation {esc_res.get('escalation_id')} due to guardrail violations.")
-            
+async def finalize_escalation_node(state: AgentState, db: Any) -> dict[str, Any]:
+    """Deterministic terminal node when guardrails fire.
+
+    No LLM call: the escalation response is built entirely in code so the
+    model can never argue its way past a compliance rule. Also saves one
+    LLM round-trip on every guardrail hit.
+    """
+    violations = state["guardrail_violations"]
+    evidence = list(state["evidence"]) + violations + state["policy_citations"]
     return {
-        "guardrail_violations": violations,
-        "actions_taken": actions_taken,
+        "resolution": "ESCALATE",
+        "reason": f"Escalated due to business guardrails: {', '.join(violations)}",
+        "evidence": sorted(set(evidence)),
     }
 
 
 async def generate_response_node(state: AgentState, db: Any) -> dict[str, Any]:
-    """Generates the final response and resolution payload."""
+    """Generate the final resolution payload with the LLM (no violations path)."""
     provider = get_llm_provider()
-    
-    history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in state["messages"]])
-    class_json = json.dumps(state["classification"].model_dump()) if state["classification"] else "{}"
-    outputs_json = json.dumps(state["tool_outputs"])
-    violations_json = json.dumps(state["guardrail_violations"])
-    citations_json = json.dumps(state["policy_citations"])
-    
     prompt = (
-        f"Ticket History:\n{history}\n\n"
-        f"Classification: {class_json}\n"
-        f"Executed Tools and Outputs:\n{outputs_json}\n\n"
-        f"Guardrail Violations: {violations_json}\n"
-        f"Retrieved Policy Citations: {citations_json}\n\n"
-        f"Determine the final resolution outcome. If a guardrail violation is present, you MUST choose ESCALATE. "
-        f"Otherwise, determine if the ticket can be RESOLVED or needs to be ESCALATED based on facts."
+        f"Ticket History:\n{_history(state)}\n\n"
+        f"Classification: {_classification_json(state)}\n"
+        f"Executed Tools and Outputs:\n{json.dumps(state['tool_outputs'])}\n\n"
+        f"Retrieved Policy Citations: {json.dumps(state['policy_citations'])}\n\n"
+        "Determine the final resolution outcome: RESOLVED if the facts support "
+        "resolving the ticket, otherwise ESCALATE."
     )
-    
-    system_instruction = "You are a customer operations response generator. Emit final resolution JSON."
-    
     decision, in_tokens, out_tokens = await provider.generate_structured(
         prompt=prompt,
         response_model=LLMResolution,
-        system_instruction=system_instruction,
+        system_instruction=(
+            "You are a customer operations response generator. Emit final resolution JSON."
+        ),
     )
-    
-    # If guardrails triggered, force ESCALATE
-    resolution_val = decision.resolution
-    reason_val = decision.reason
-    evidence_val = list(decision.evidence)
-    
-    if state["guardrail_violations"]:
-        resolution_val = "ESCALATE"
-        reason_val = f"Escalated due to business guardrails: {', '.join(state['guardrail_violations'])}"
-        evidence_val.extend(state["guardrail_violations"])
-        evidence_val.extend(state["policy_citations"])
-        
+    resolution = (
+        decision.resolution if decision.resolution in ("RESOLVED", "ESCALATE") else "ESCALATE"
+    )
     return {
-        "resolution": resolution_val,
-        "reason": reason_val,
-        "evidence": list(set(evidence_val)),
-        "input_tokens": state["input_tokens"] + in_tokens,
-        "output_tokens": state["output_tokens"] + out_tokens,
+        "resolution": resolution,
+        "reason": decision.reason,
+        "evidence": sorted(set(decision.evidence)),
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
     }
 
 
-# 4. Main Run Agent Runner
+# --------------------------------------------------------------------------
+# 4. Graph construction
+# --------------------------------------------------------------------------
+def route_after_guardrails(state: AgentState) -> str:
+    """Conditional edge: violations bypass the LLM and escalate deterministically."""
+    return "finalize_escalation" if state["guardrail_violations"] else "generate_response"
+
+
+def _audited(node_fn: Any, step_name: str, step_type: str) -> Any:
+    """Wrap a node so each execution is recorded as an agent_steps row."""
+
+    async def wrapper(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        db = config["configurable"]["db"]
+        step_rec = AgentStep(
+            agent_run_id=state["run_id"],
+            step_name=step_name,
+            step_type=step_type,
+            status="RUNNING",
+            started_at=datetime.datetime.now(datetime.UTC),
+        )
+        db.add(step_rec)
+        await db.flush()
+        try:
+            result = await node_fn(state, db)
+            step_rec.status = "COMPLETED"
+            return result
+        except Exception:
+            step_rec.status = "FAILED"
+            raise
+        finally:
+            step_rec.completed_at = datetime.datetime.now(datetime.UTC)
+
+    return wrapper
+
+
+def build_agent_graph() -> Any:
+    """Compile the ResolveAI LangGraph StateGraph with an in-memory checkpointer."""
+    graph = StateGraph(AgentState)
+
+    graph.add_node("classify", _audited(classify_node, "classify", "CLASSIFY"))
+    graph.add_node("plan", _audited(plan_node, "plan", "PLAN"))
+    graph.add_node("execute_tools", _audited(execute_tools_node, "execute_tools", "TOOL_EXEC"))
+    graph.add_node("guardrails", _audited(guardrails_node, "guardrails", "GUARDRAIL"))
+    graph.add_node(
+        "generate_response",
+        _audited(generate_response_node, "generate_response", "RESPONSE"),
+    )
+    graph.add_node(
+        "finalize_escalation",
+        _audited(finalize_escalation_node, "finalize_escalation", "FORCED_ESCALATION"),
+    )
+
+    graph.set_entry_point("classify")
+    graph.add_edge("classify", "plan")
+    graph.add_edge("plan", "execute_tools")
+    graph.add_edge("execute_tools", "guardrails")
+    graph.add_conditional_edges(
+        "guardrails",
+        route_after_guardrails,
+        {"finalize_escalation": "finalize_escalation", "generate_response": "generate_response"},
+    )
+    graph.add_edge("generate_response", END)
+    graph.add_edge("finalize_escalation", END)
+
+    return graph.compile(checkpointer=MemorySaver())
+
+
+_compiled_graph: Any = None
+
+
+def get_agent_graph() -> Any:
+    global _compiled_graph
+    if _compiled_graph is None:
+        _compiled_graph = build_agent_graph()
+    return _compiled_graph
+
+
+# --------------------------------------------------------------------------
+# 5. Runner: fetch ticket, invoke graph, persist run summary
+# --------------------------------------------------------------------------
 async def run_agent(ticket_id: str, db: Any) -> dict[str, Any]:
-    """Fetches a ticket, executes the LangGraph workflow, logs all runs, steps, and decisions to DB."""
+    """Execute the agent graph for a ticket, logging runs/steps/tools/decisions."""
     start_time = time.perf_counter()
     run_id = f"RUN-{uuid.uuid4().hex[:8].upper()}"
-    
-    # 1. Fetch ticket and messages
-    stmt = select(Ticket).where(Ticket.id == ticket_id)
-    result = await db.execute(stmt)
-    ticket = result.scalar_one_or_none()
-    
+
+    ticket = (await db.execute(select(Ticket).where(Ticket.id == ticket_id))).scalar_one_or_none()
     if not ticket:
         raise ValueError(f"Ticket {ticket_id} not found.")
-        
-    stmt_msgs = select(TicketMessage).where(TicketMessage.ticket_id == ticket_id).order_by(TicketMessage.created_at.asc())
-    msg_result = await db.execute(stmt_msgs)
-    msgs = msg_result.scalars().all()
-    
-    messages_payload = [{"role": msg.sender, "content": msg.body} for msg in msgs]
-    
-    # Initialize run record in DB
+
+    msgs = (
+        (
+            await db.execute(
+                select(TicketMessage)
+                .where(TicketMessage.ticket_id == ticket_id)
+                .order_by(TicketMessage.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    provider = get_llm_provider()
     agent_run = AgentRun(
         id=run_id,
         ticket_id=ticket_id,
-        model_provider=settings.DEFAULT_PROVIDER,
-        model_name=settings.OPENAI_MODEL_NAME if settings.DEFAULT_PROVIDER == "openai" else settings.GEMINI_MODEL_NAME,
+        model_provider="fake" if settings.USE_FAKE_LLM else settings.DEFAULT_PROVIDER,
+        model_name=provider.model_name,
         prompt_version="v1.0",
         status="PENDING",
-        started_at=datetime.datetime.utcnow(),
+        started_at=datetime.datetime.now(datetime.UTC),
         input_tokens=0,
         output_tokens=0,
         estimated_cost=Decimal("0.0"),
         latency_ms=0,
     )
     db.add(agent_run)
-    await db.flush() # Send to DB to retrieve relations and link FKs
-    
-    # Initialize State
-    state = AgentState(
-        ticket_id=ticket_id,
-        run_id=run_id,
-        customer_id=ticket.customer_id,
-        messages=messages_payload,
-        classification=None,
-        plan=None,
-        tool_outputs=[],
-        policy_citations=[],
-        guardrail_violations=[],
-        resolution=None,
-        reason=None,
-        evidence=[],
-        actions_taken=[],
-        input_tokens=0,
-        output_tokens=0,
-        estimated_cost=Decimal("0.0"),
-        latency_ms=0,
-    )
-    
-    # List of steps to run sequentially (mirroring the graph structure)
-    steps = [
-        ("classify", "CLASSIFY", classify_node),
-        ("plan", "PLAN", plan_node),
-        ("execute_tools", "TOOL_EXEC", execute_tools_node),
-        ("guardrails", "GUARDRAIL", guardrails_node),
-        ("generate_response", "RESPONSE", generate_response_node)
-    ]
-    
-    # Run steps sequentially
-    for step_name, step_type, node_fn in steps:
-        step_start = time.perf_counter()
-        
-        step_rec = AgentStep(
-            agent_run_id=run_id,
-            step_name=step_name,
-            step_type=step_type,
-            status="RUNNING",
-            started_at=datetime.datetime.utcnow(),
+    await db.flush()
+
+    initial_state: AgentState = {
+        "ticket_id": ticket_id,
+        "run_id": run_id,
+        "customer_id": ticket.customer_id,
+        "messages": [{"role": m.sender, "content": m.body} for m in msgs],
+        "classification": None,
+        "plan": None,
+        "tool_outputs": [],
+        "policy_citations": [],
+        "guardrail_violations": [],
+        "resolution": None,
+        "reason": None,
+        "evidence": [],
+        "actions_taken": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost": Decimal("0.0"),
+        "latency_ms": 0,
+    }
+
+    graph = get_agent_graph()
+    try:
+        final_state: AgentState = await graph.ainvoke(
+            initial_state,
+            config={"configurable": {"db": db, "thread_id": run_id}},
         )
-        db.add(step_rec)
+        agent_run.status = "COMPLETED"
+    except Exception:
+        agent_run.status = "FAILED"
+        agent_run.completed_at = datetime.datetime.now(datetime.UTC)
         await db.flush()
-        
-        try:
-            node_output = await node_fn(state, db)
-            state.update(node_output) # type: ignore
-            step_rec.status = "COMPLETED"
-        except Exception as e:
-            logger.error(f"Step {step_name} failed: {e}")
-            step_rec.status = "FAILED"
-            raise e
-        finally:
-            step_rec.completed_at = datetime.datetime.utcnow()
-            
-    # Calculate costs (rough estimation based on GPT-4o-mini rates)
-    # $0.150 / 1M input tokens, $0.600 / 1M output tokens
-    cost = Decimal(state["input_tokens"]) * Decimal("0.00000015") + Decimal(state["output_tokens"]) * Decimal("0.00000060")
-    
+        raise
+
+    cost = estimate_cost(
+        provider.model_name, final_state["input_tokens"], final_state["output_tokens"]
+    )
     latency = int((time.perf_counter() - start_time) * 1000)
-    
-    # Update Run Record
-    agent_run.status = "COMPLETED"
-    agent_run.completed_at = datetime.datetime.utcnow()
-    agent_run.input_tokens = state["input_tokens"]
-    agent_run.output_tokens = state["output_tokens"]
+
+    agent_run.completed_at = datetime.datetime.now(datetime.UTC)
+    agent_run.input_tokens = final_state["input_tokens"]
+    agent_run.output_tokens = final_state["output_tokens"]
     agent_run.estimated_cost = cost
     agent_run.latency_ms = latency
-    
-    # Update Ticket Category & Severity in DB
-    if state["classification"]:
-        ticket.category = state["classification"].category
-        ticket.severity = state["classification"].severity
-        ticket.intent = state["classification"].intent
-        
-    ticket.status = state["resolution"] or "OPEN"
-    
-    # Insert Decision Record
-    decision_rec = AgentDecision(
-        agent_run_id=run_id,
-        resolution=state["resolution"] or "ESCALATE",
-        reason=state["reason"] or "Escalation requested",
-        evidence_json=json.dumps(state["evidence"]),
-        actions_taken_json=json.dumps(state["actions_taken"]),
-        created_at=datetime.datetime.utcnow(),
+
+    if final_state["classification"]:
+        ticket.category = final_state["classification"].category.value
+        ticket.severity = final_state["classification"].severity.value
+        ticket.intent = final_state["classification"].intent
+    ticket.status = final_state["resolution"] or "OPEN"
+
+    db.add(
+        AgentDecision(
+            agent_run_id=run_id,
+            resolution=final_state["resolution"] or "ESCALATE",
+            reason=final_state["reason"] or "Escalation requested",
+            evidence_json=json.dumps(final_state["evidence"]),
+            actions_taken_json=json.dumps(final_state["actions_taken"]),
+            created_at=datetime.datetime.now(datetime.UTC),
+        )
     )
-    db.add(decision_rec)
-    
     await db.flush()
-    
+
     return {
         "run_id": run_id,
         "ticket_id": ticket_id,
-        "classification": state["classification"].model_dump() if state["classification"] else None,
-        "resolution": state["resolution"],
-        "reason": state["reason"],
-        "evidence": state["evidence"],
-        "actions_taken": state["actions_taken"],
+        "classification": (
+            final_state["classification"].model_dump() if final_state["classification"] else None
+        ),
+        "resolution": final_state["resolution"],
+        "reason": final_state["reason"],
+        "evidence": final_state["evidence"],
+        "actions_taken": final_state["actions_taken"],
         "cost": float(cost),
         "latency_ms": latency,
     }

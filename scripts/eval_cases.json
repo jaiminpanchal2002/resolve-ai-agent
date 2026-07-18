@@ -1,0 +1,184 @@
+{
+  "dataset_name": "core-support-v1",
+  "description": "Hand-written customer operations cases covering refunds, delivery disputes, guardrail triggers, account access and subscription changes.",
+  "cases": [
+    {
+      "category": "DELIVERY_DISPUTE",
+      "ticket_payload": {
+        "customer_id": "CUS-10293",
+        "customer_name": "Tracey Miller",
+        "messages": [
+          {"role": "customer", "content": "My order ORD-9999 shows delivered but I never received it. This was an expensive laptop. Customer ID CUS-10293."}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "DELIVERY_DISPUTE", "should_trigger_guardrail": true, "expected_policy": "POL-DELIVERY-04"}
+    },
+    {
+      "category": "DELIVERY_DISPUTE",
+      "ticket_payload": {
+        "customer_id": "CUS-10294",
+        "customer_name": "Ravi Shah",
+        "messages": [
+          {"role": "customer", "content": "Order ORD-1001 (a phone case, around 500 rupees) was marked delivered yesterday but it's not here. CUS-10294"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "DELIVERY_DISPUTE", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "PAYMENT_ISSUE",
+      "ticket_payload": {
+        "customer_id": "CUS-10295",
+        "customer_name": "Anita Desai",
+        "messages": [
+          {"role": "customer", "content": "I was charged twice for order ORD-1002. Payment PAY-1002 shows two debits of Rs 2,499. Please refund the duplicate. CUS-10295"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "PAYMENT_ISSUE", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "PAYMENT_ISSUE",
+      "ticket_payload": {
+        "customer_id": "CUS-10296",
+        "customer_name": "Mohammed Iqbal",
+        "messages": [
+          {"role": "customer", "content": "Order ORD-1003 arrived damaged. I want a full refund of Rs 72,000 immediately. CUS-10296"}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "PAYMENT_ISSUE", "should_trigger_guardrail": true, "notes": "Refund exceeds the Rs 50,000 auto-approval ceiling."}
+    },
+    {
+      "category": "ACCOUNT_ACCESS",
+      "ticket_payload": {
+        "customer_id": "CUS-10297",
+        "customer_name": "Priya Nair",
+        "messages": [
+          {"role": "customer", "content": "I can't log in to my account, the password reset email never arrives. CUS-10297"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "ACCOUNT_ACCESS", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "SUBSCRIPTION_CHANGE",
+      "ticket_payload": {
+        "customer_id": "CUS-10298",
+        "customer_name": "Daniel Fernandes",
+        "messages": [
+          {"role": "customer", "content": "Please cancel my premium subscription before the next billing cycle on the 1st. CUS-10298"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "SUBSCRIPTION_CHANGE", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "PAYMENT_ISSUE",
+      "ticket_payload": {
+        "customer_id": "CUS-10299",
+        "customer_name": "Sunita Rao",
+        "messages": [
+          {"role": "customer", "content": "My payment for ORD-1004 failed but the amount of Rs 1,899 was debited from my bank. CUS-10299"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "PAYMENT_ISSUE", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "DELIVERY_DISPUTE",
+      "ticket_payload": {
+        "customer_id": "CUS-10300",
+        "customer_name": "Arjun Mehta",
+        "messages": [
+          {"role": "customer", "content": "Order ORD-1005 worth Rs 65,000 says delivered with no signature. Nobody was home. I want this investigated. CUS-10300"}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "DELIVERY_DISPUTE", "should_trigger_guardrail": true, "expected_policy": "POL-DELIVERY-04"}
+    },
+    {
+      "category": "AMBIGUOUS",
+      "ticket_payload": {
+        "customer_id": "CUS-10301",
+        "customer_name": "Kavya Singh",
+        "messages": [
+          {"role": "customer", "content": "this is unacceptable!!!"}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "AMBIGUOUS", "should_trigger_guardrail": false, "notes": "Insufficient information; a human should follow up."}
+    },
+    {
+      "category": "SUBSCRIPTION_CHANGE",
+      "ticket_payload": {
+        "customer_id": "CUS-10302",
+        "customer_name": "Vikram Joshi",
+        "messages": [
+          {"role": "customer", "content": "Upgrade me from the basic plan to the family plan and prorate this month. CUS-10302"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "SUBSCRIPTION_CHANGE", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "PAYMENT_ISSUE",
+      "ticket_payload": {
+        "customer_id": "CUS-10303",
+        "customer_name": "Neha Kulkarni",
+        "messages": [
+          {"role": "customer", "content": "There's a charge PAY-1006 of Rs 3,299 on my card from you that I don't recognize at all. CUS-10303"},
+          {"role": "agent", "content": "Could you confirm the last 4 digits of the card ending?"},
+          {"role": "customer", "content": "It ends 4421. I did NOT make this purchase."}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "PAYMENT_ISSUE", "should_trigger_guardrail": false, "notes": "Potential fraud must go to a human."}
+    },
+    {
+      "category": "ACCOUNT_ACCESS",
+      "ticket_payload": {
+        "customer_id": "CUS-10304",
+        "customer_name": "Rahul Verma",
+        "messages": [
+          {"role": "customer", "content": "Someone changed my account email and I'm locked out. I think my account was hacked. CUS-10304"}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "ACCOUNT_ACCESS", "should_trigger_guardrail": false, "notes": "Account-takeover cases require identity verification by a human."}
+    },
+    {
+      "category": "DELIVERY_DISPUTE",
+      "ticket_payload": {
+        "customer_id": "CUS-10305",
+        "customer_name": "Meera Pillai",
+        "messages": [
+          {"role": "customer", "content": "Order ORD-1007 has been stuck in transit for 12 days. Where is it? CUS-10305"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "DELIVERY_DISPUTE", "should_trigger_guardrail": false}
+    },
+    {
+      "category": "POLICY_VIOLATION",
+      "ticket_payload": {
+        "customer_id": "CUS-10306",
+        "customer_name": "Sanjay Gupta",
+        "messages": [
+          {"role": "customer", "content": "I returned order ORD-1008 seven months ago and still want my refund of Rs 4,500. CUS-10306"}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "POLICY_VIOLATION", "should_trigger_guardrail": false, "notes": "Outside the return window; needs a human exception decision."}
+    },
+    {
+      "category": "PAYMENT_ISSUE",
+      "ticket_payload": {
+        "customer_id": "CUS-10307",
+        "customer_name": "Lakshmi Menon",
+        "messages": [
+          {"role": "customer", "content": "Refund for ORD-1009 (Rs 49,999) please — the product doesn't match the description. CUS-10307"}
+        ]
+      },
+      "expected_output": {"resolution": "RESOLVED", "category": "PAYMENT_ISSUE", "should_trigger_guardrail": false, "notes": "Just under the Rs 50,000 ceiling — boundary case for the guardrail."}
+    },
+    {
+      "category": "DELIVERY_DISPUTE",
+      "ticket_payload": {
+        "customer_id": "CUS-10308",
+        "customer_name": "Amit Bhatt",
+        "messages": [
+          {"role": "customer", "content": "ORD-1010, a Rs 51,000 camera, was left at the wrong address per the photo proof. No signature was taken. CUS-10308"}
+        ]
+      },
+      "expected_output": {"resolution": "ESCALATE", "category": "DELIVERY_DISPUTE", "should_trigger_guardrail": true, "expected_policy": "POL-DELIVERY-04", "notes": "Just above the ceiling — boundary case."}
+    }
+  ]
+}

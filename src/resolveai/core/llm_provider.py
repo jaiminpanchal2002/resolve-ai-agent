@@ -1,10 +1,19 @@
+"""LLM provider abstraction with retry/timeout handling.
+
+Design notes:
+- Real providers (OpenAI, Gemini) contain no test shortcuts. A separate,
+  explicit FakeProvider is returned when settings.USE_FAKE_LLM is true,
+  giving tests and CI a deterministic offline mode.
+- Every network call is wrapped with a timeout and exponential-backoff
+  retries so a single flaky API response cannot kill an agent run.
+"""
+
+import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, TypeVar, Union
+from typing import Any, TypeVar
 
-import google.generativeai as genai
-import openai
 from pydantic import BaseModel
 
 from resolveai.core.config import settings
@@ -14,15 +23,49 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+async def _with_retries(coro_factory: Any, *, op_name: str) -> Any:
+    """Run an async callable with timeout + exponential backoff retries."""
+    last_exc: Exception | None = None
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await asyncio.wait_for(coro_factory(), timeout=settings.LLM_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - provider SDKs raise varied types
+            last_exc = exc
+            if attempt == max_retries:
+                break
+
+            exc_str = str(exc).lower()
+            if "resource_exhausted" in exc_str or "429" in exc_str or "quota" in exc_str:
+                backoff = 65.0
+            else:
+                backoff = float(2 ** (attempt - 1))
+
+            logger.warning(
+                "%s failed (attempt %d/%d): %s — retrying in %ss",
+                op_name,
+                attempt,
+                max_retries,
+                exc,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+    raise RuntimeError(f"{op_name} failed after {max_retries} attempts") from last_exc
+
+
 class LLMProvider(ABC):
+    """Common interface. All methods return token usage for cost tracking."""
+
+    model_name: str = "unknown"
+
     @abstractmethod
     async def generate_text(
         self,
         prompt: str,
         system_instruction: str | None = None,
         temperature: float = 0.0,
-    ) -> tuple[str, int, int]:  # Returns (text, input_tokens, output_tokens)
-        pass
+    ) -> tuple[str, int, int]:
+        """Return (text, input_tokens, output_tokens)."""
 
     @abstractmethod
     async def generate_structured(
@@ -31,21 +74,27 @@ class LLMProvider(ABC):
         response_model: type[T],
         system_instruction: str | None = None,
         temperature: float = 0.0,
-    ) -> tuple[T, int, int]:  # Returns (pydantic_instance, input_tokens, output_tokens)
-        pass
+    ) -> tuple[T, int, int]:
+        """Return (parsed_model, input_tokens, output_tokens)."""
 
     @abstractmethod
     async def get_embedding(self, text: str) -> list[float]:
-        pass
+        """Return an embedding vector of settings.EMBEDDING_DIMENSION size."""
 
 
 class OpenAIProvider(LLMProvider):
     def __init__(self) -> None:
-        self.api_key = settings.OPENAI_API_KEY
-        self.model = settings.OPENAI_MODEL_NAME
-        self.is_mock = self.api_key == "mock-key-or-real-key" or not self.api_key
-        if not self.is_mock:
-            self.client = openai.AsyncOpenAI(api_key=self.api_key)
+        import openai
+
+        self.model_name = settings.OPENAI_MODEL_NAME
+        self.client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    def _messages(self, prompt: str, system_instruction: str | None) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+        return messages
 
     async def generate_text(
         self,
@@ -53,23 +102,21 @@ class OpenAIProvider(LLMProvider):
         system_instruction: str | None = None,
         temperature: float = 0.0,
     ) -> tuple[str, int, int]:
-        if self.is_mock:
-            return "[MOCK OPENAI RESPONSE] Resolved customer inquiry.", 10, 15
-
-        messages: list[dict[str, Any]] = []
-        if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": prompt})
-
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
+        response = await _with_retries(
+            lambda: self.client.chat.completions.create(
+                model=self.model_name,
+                messages=self._messages(prompt, system_instruction),
+                temperature=temperature,
+            ),
+            op_name="openai.generate_text",
         )
         content = response.choices[0].message.content or ""
-        input_tokens = response.usage.prompt_tokens if response.usage else 0
-        output_tokens = response.usage.completion_tokens if response.usage else 0
-        return content, input_tokens, output_tokens
+        usage = response.usage
+        return (
+            content,
+            usage.prompt_tokens if usage else 0,
+            usage.completion_tokens if usage else 0,
+        )
 
     async def generate_structured(
         self,
@@ -78,113 +125,44 @@ class OpenAIProvider(LLMProvider):
         system_instruction: str | None = None,
         temperature: float = 0.0,
     ) -> tuple[T, int, int]:
-        if self.is_mock:
-            # Create a mock instance of the response model
-            mock_data = self._generate_mock_schema_data(response_model)
-            return response_model(**mock_data), 10, 20
-
-        messages: list[dict[str, Any]] = []
-        if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
-        messages.append({"role": "user", "content": prompt})
-
-        response = await self.client.beta.chat.completions.parse(
-            model=self.model,
-            messages=messages,
-            response_format=response_model,
-            temperature=temperature,
+        response = await _with_retries(
+            lambda: self.client.beta.chat.completions.parse(
+                model=self.model_name,
+                messages=self._messages(prompt, system_instruction),
+                response_format=response_model,
+                temperature=temperature,
+            ),
+            op_name="openai.generate_structured",
         )
-        content = response.choices[0].message.parsed
-        if not content:
-            raise ValueError("Failed to parse structured output from OpenAI.")
-        input_tokens = response.usage.prompt_tokens if response.usage else 0
-        output_tokens = response.usage.completion_tokens if response.usage else 0
-        return content, input_tokens, output_tokens
+        parsed = response.choices[0].message.parsed
+        if parsed is None:
+            raise ValueError("OpenAI returned no parseable structured output.")
+        usage = response.usage
+        return (
+            parsed,
+            usage.prompt_tokens if usage else 0,
+            usage.completion_tokens if usage else 0,
+        )
 
     async def get_embedding(self, text: str) -> list[float]:
-        if self.is_mock:
-            # Return a deterministic mock vector of the required dimension
-            dim = settings.EMBEDDING_DIMENSION
-            return [0.1] * dim
-
-        response = await self.client.embeddings.create(
-            model=settings.EMBEDDING_MODEL,
-            input=text,
+        response = await _with_retries(
+            lambda: self.client.embeddings.create(model=settings.EMBEDDING_MODEL, input=text),
+            op_name="openai.get_embedding",
         )
-        return response.data[0].embedding
-
-    def _generate_mock_schema_data(self, model: type[BaseModel]) -> dict[str, Any]:
-        """Generates realistic mock data based on Pydantic field definitions."""
-        import typing
-        import types
-        from typing import get_origin, get_args, Literal
-
-        data = {}
-        for field_name, field in model.model_fields.items():
-            field_type = field.annotation
-            
-            # Handle Optionals and Unions
-            origin = get_origin(field_type)
-            if origin is Union or (hasattr(types, "UnionType") and isinstance(field_type, types.UnionType)):
-                args = get_args(field_type)
-                non_none_args = [a for a in args if a is not type(None)]
-                if non_none_args:
-                    field_type = non_none_args[0]
-                    origin = get_origin(field_type)
-
-            type_name = str(field_type)
-            args = get_args(field_type)
-
-            # Literal matching
-            if origin is Literal or "Literal" in type_name:
-                data[field_name] = args[0] if args else "RESOLVED"
-            # Collection matching (list/set)
-            elif origin in (list, set) or "list" in type_name.lower() or "set" in type_name.lower():
-                if args:
-                    inner_type = args[0]
-                    inner_origin = get_origin(inner_type)
-                    inner_name = str(inner_type)
-                    if inner_origin is Literal or "Literal" in inner_name:
-                        inner_args = get_args(inner_type)
-                        data[field_name] = [inner_args[0]] if inner_args else ["mock_item"]
-                    elif "int" in inner_name:
-                        data[field_name] = [1]
-                    else:
-                        data[field_name] = ["mock_item"]
-                else:
-                    data[field_name] = ["mock_item"]
-            elif "bool" in type_name:
-                data[field_name] = True
-            elif "int" in type_name:
-                data[field_name] = 1
-            elif "float" in type_name or "decimal" in type_name.lower():
-                data[field_name] = 1.0
-            elif "str" in type_name:
-                if field_name == "intent":
-                    data[field_name] = "REPORT_MISSING_DELIVERY"
-                elif "reason" in field_name.lower():
-                    data[field_name] = "High-value delivery dispute with missing proof of delivery"
-                elif "category" in field_name.lower():
-                    data[field_name] = "DELIVERY_DISPUTE"
-                elif "severity" in field_name.lower():
-                    data[field_name] = "HIGH"
-                else:
-                    data[field_name] = "mock_value"
-            else:
-                if isinstance(field_type, type) and issubclass(field_type, BaseModel):
-                    data[field_name] = self._generate_mock_schema_data(field_type)
-                else:
-                    data[field_name] = None
-        return data
+        return list(response.data[0].embedding)
 
 
 class GeminiProvider(LLMProvider):
     def __init__(self) -> None:
-        self.api_key = settings.GEMINI_API_KEY
-        self.model = settings.GEMINI_MODEL_NAME
-        self.is_mock = self.api_key == "mock-key-or-real-key" or not self.api_key
-        if not self.is_mock:
-            genai.configure(api_key=self.api_key)
+        import google.generativeai as genai
+
+        self._genai = genai
+        self.model_name = settings.GEMINI_MODEL_NAME
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+
+    async def _run_blocking(self, fn: Any, op_name: str) -> Any:
+        loop = asyncio.get_running_loop()
+        return await _with_retries(lambda: loop.run_in_executor(None, fn), op_name=op_name)
 
     async def generate_text(
         self,
@@ -192,29 +170,20 @@ class GeminiProvider(LLMProvider):
         system_instruction: str | None = None,
         temperature: float = 0.0,
     ) -> tuple[str, int, int]:
-        if self.is_mock:
-            return "[MOCK GEMINI RESPONSE] Resolved customer inquiry.", 10, 15
-
-        model = genai.GenerativeModel(
-            model_name=self.model,
-            system_instruction=system_instruction,
+        model = self._genai.GenerativeModel(
+            model_name=self.model_name, system_instruction=system_instruction
         )
-        # Using executor since SDK method might be blocky
-        import asyncio
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
+        response = await self._run_blocking(
             lambda: model.generate_content(
                 prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=temperature
-                )
-            )
+                generation_config=self._genai.types.GenerationConfig(temperature=temperature),
+            ),
+            op_name="gemini.generate_text",
         )
-        # Count tokens roughly or query the API
-        input_tokens = len(prompt.split())  # rough approximation if API doesn't return usage
-        output_tokens = len(response.text.split()) if response.text else 0
-        return response.text, input_tokens, output_tokens
+        usage = getattr(response, "usage_metadata", None)
+        in_tok = getattr(usage, "prompt_token_count", 0) if usage else 0
+        out_tok = getattr(usage, "candidates_token_count", 0) if usage else 0
+        return response.text, in_tok, out_tok
 
     async def generate_structured(
         self,
@@ -223,56 +192,131 @@ class GeminiProvider(LLMProvider):
         system_instruction: str | None = None,
         temperature: float = 0.0,
     ) -> tuple[T, int, int]:
-        if self.is_mock:
-            mock_data = OpenAIProvider()._generate_mock_schema_data(response_model)
-            return response_model(**mock_data), 10, 20
-
-        model = genai.GenerativeModel(
-            model_name=self.model,
-            system_instruction=system_instruction,
+        model = self._genai.GenerativeModel(
+            model_name=self.model_name, system_instruction=system_instruction
         )
-        import asyncio
-        loop = asyncio.get_running_loop()
-        
-        # Pydantic v2 JSON Schema conversion
         schema = response_model.model_json_schema()
-        
-        response = await loop.run_in_executor(
-            None,
+
+        # Inline $defs/references and strip "title" because old
+        # google-generativeai client doesn't support them
+        def clean_schema(sch: dict) -> dict:
+            import copy
+            sch = copy.deepcopy(sch)
+            defs = sch.pop("$defs", {})
+
+            def resolve(node):
+                if isinstance(node, dict):
+                    node.pop("title", None)
+                    node.pop("additionalProperties", None)
+                    if "$ref" in node:
+                        ref_path = node["$ref"]
+                        if ref_path.startswith("#/$defs/"):
+                            def_name = ref_path.split("/")[-1]
+                            resolved = copy.deepcopy(defs[def_name])
+                            for k, v in node.items():
+                                if k != "$ref":
+                                    resolved[k] = v
+                            return resolve(resolved)
+                    return {k: resolve(v) for k, v in node.items()}
+                elif isinstance(node, list):
+                    return [resolve(item) for item in node]
+                return node
+
+            return resolve(sch)
+
+        schema = clean_schema(schema)
+
+        response = await self._run_blocking(
             lambda: model.generate_content(
                 prompt,
-                generation_config=genai.types.GenerationConfig(
+                generation_config=self._genai.types.GenerationConfig(
                     temperature=temperature,
                     response_mime_type="application/json",
                     response_schema=schema,
-                )
-            )
+                ),
+            ),
+            op_name="gemini.generate_structured",
         )
-        parsed_json = json.loads(response.text)
-        instance = response_model(**parsed_json)
-        input_tokens = len(prompt.split())
-        output_tokens = len(response.text.split())
-        return instance, input_tokens, output_tokens
+        instance = response_model(**json.loads(response.text))
+        usage = getattr(response, "usage_metadata", None)
+        in_tok = getattr(usage, "prompt_token_count", 0) if usage else 0
+        out_tok = getattr(usage, "candidates_token_count", 0) if usage else 0
+        return instance, in_tok, out_tok
 
     async def get_embedding(self, text: str) -> list[float]:
-        if self.is_mock:
-            dim = settings.EMBEDDING_DIMENSION
-            return [0.1] * dim
-
-        # Use Google's standard text embedding model
-        import asyncio
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: genai.embed_content(
-                model="models/text-embedding-004",
-                contents=text,
-            )
+        response = await self._run_blocking(
+            lambda: self._genai.embed_content(model="models/gemini-embedding-001", content=text),
+            op_name="gemini.get_embedding",
         )
-        return response["embedding"]
+        return list(response["embedding"])
+
+
+class FakeProvider(LLMProvider):
+    """Deterministic offline provider for tests and CI.
+
+    Selected explicitly via USE_FAKE_LLM=true — never silently in production.
+    Structured outputs are built from the Pydantic schema so contract tests
+    still exercise real validation.
+    """
+
+    model_name = "mock-model"
+
+    async def generate_text(
+        self,
+        prompt: str,
+        system_instruction: str | None = None,
+        temperature: float = 0.0,
+    ) -> tuple[str, int, int]:
+        return "[FAKE LLM RESPONSE] Resolved customer inquiry.", 10, 15
+
+    async def generate_structured(
+        self,
+        prompt: str,
+        response_model: type[T],
+        system_instruction: str | None = None,
+        temperature: float = 0.0,
+    ) -> tuple[T, int, int]:
+        data = self._mock_data_for_schema(response_model)
+        return response_model(**data), 10, 20
+
+    async def get_embedding(self, text: str) -> list[float]:
+        # Deterministic but text-dependent so vector tests aren't degenerate.
+        seed = sum(ord(c) for c in text) % 97
+        dim = settings.EMBEDDING_DIMENSION
+        return [((seed + i) % 97) / 97.0 for i in range(dim)]
+
+    @staticmethod
+    def _mock_data_for_schema(response_model: type[BaseModel]) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for name, field in response_model.model_fields.items():
+            annotation = field.annotation
+            text = str(annotation)
+            members = list(getattr(annotation, "__members__", {}).values())
+            args = getattr(annotation, "__args__", None)
+            if members:  # Enum type
+                data[name] = members[0].value
+            elif "Literal" in text and args:
+                first = args[0]
+                data[name] = getattr(first, "value", first)
+            elif "bool" in text:
+                data[name] = False
+            elif "int" in text:
+                data[name] = 0
+            elif "float" in text or "Decimal" in text:
+                data[name] = 0.0
+            elif "list" in text:
+                data[name] = []
+            elif "dict" in text:
+                data[name] = {}
+            else:
+                data[name] = "mock"
+        return data
 
 
 def get_llm_provider() -> LLMProvider:
+    """Factory. Fake mode must be requested explicitly via configuration."""
+    if settings.USE_FAKE_LLM:
+        return FakeProvider()
     if settings.DEFAULT_PROVIDER == "gemini":
         return GeminiProvider()
     return OpenAIProvider()

@@ -7,70 +7,58 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  lint-and-unit:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: ankane/pgvector:v0.5.1
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: resolveai
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-name: '3.12'
-        python-version: '3.12'
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install .
-        pip install pytest pytest-cov pytest-asyncio testcontainers[postgres,redis] ruff pyright httpx
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-cov pytest-asyncio "testcontainers[postgres,redis]" ruff httpx
 
-    - name: Lint with Ruff
-      run: |
-        ruff check app/ tests/
+      - name: Lint with Ruff
+        run: ruff check src/ tests/ scripts/
 
-    - name: Typecheck with Pyright
-      run: |
-        pyright app/ tests/
+      - name: Unit tests (no containers, fake LLM)
+        env:
+          USE_FAKE_LLM: "true"
+        run: pytest tests/unit tests/contract --cov=resolveai --cov-report=xml
 
-    - name: Run Pytest
-      env:
-        DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/resolveai
-        DATABASE_SYNC_URL: postgresql+psycopg://postgres:postgres@localhost:5432/resolveai
-        REDIS_URL: redis://localhost:6379/0
-        OPENAI_API_KEY: mock-key-or-real-key
-        GEMINI_API_KEY: mock-key-or-real-key
-      run: |
-        pytest --cov=app --cov-report=xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.xml
+          fail_ci_if_error: false
 
-    - name: Upload coverage reports to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        file: ./coverage.xml
-        fail_ci_if_error: false
+  integration:
+    runs-on: ubuntu-latest
+    needs: lint-and-unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-asyncio "testcontainers[postgres,redis]" httpx
+
+      # Testcontainers spins up ephemeral pgvector + Redis using the runner's Docker daemon
+      - name: Integration and E2E tests (fake LLM)
+        env:
+          USE_FAKE_LLM: "true"
+        run: pytest tests/integration tests/e2e

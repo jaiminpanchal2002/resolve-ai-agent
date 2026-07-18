@@ -1,11 +1,10 @@
 from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Core Application Config
     ENVIRONMENT: Literal["development", "production", "testing"] = "development"
@@ -24,6 +23,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = "mock-key-or-real-key"
     GEMINI_MODEL_NAME: str = "gemini-1.5-flash"
     DEFAULT_PROVIDER: Literal["openai", "gemini"] = "openai"
+    USE_FAKE_LLM: bool = False  # deterministic offline provider for tests/CI
+    LLM_TIMEOUT_SECONDS: float = 30.0
+    LLM_MAX_RETRIES: int = 3
+
+    # CORS (explicit origins; wildcard + credentials is invalid per spec)
+    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     # RAG Config
     EMBEDDING_MODEL: str = "text-embedding-3-small"

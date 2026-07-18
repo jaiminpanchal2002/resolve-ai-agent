@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator, Generator
+
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -25,6 +26,7 @@ sync_engine = create_engine(
     settings.DATABASE_SYNC_URL,
     echo=False,
     pool_pre_ping=True,
+    connect_args={"client_encoding": "utf8"},
 )
 
 sync_session_factory = sessionmaker(

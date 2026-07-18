@@ -33,6 +33,7 @@ coverage.xml
 *.sqlite
 .redis/
 .postgres_data/
+pg_data/
 
 # Environment
 .env

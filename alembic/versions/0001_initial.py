@@ -8,7 +8,6 @@ Create Date: 2026-07-15 12:00:00.000000
 from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
-import pgvector.sqlalchemy
 
 # revision identifiers, used by Alembic.
 revision: str = '0001_initial'
@@ -19,7 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # Enable pgvector extension
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    # op.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
     # Create users
     op.create_table(
@@ -133,7 +132,7 @@ def upgrade() -> None:
         sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
         sa.Column('policy_id', sa.String(length=50), nullable=False),
         sa.Column('content', sa.Text(), nullable=False),
-        sa.Column('embedding', pgvector.sqlalchemy.Vector(dim=1536), nullable=False),
+        sa.Column('embedding', sa.ARRAY(sa.Float), nullable=False),
         sa.Column('chunk_index', sa.Integer(), nullable=False),
         sa.ForeignKeyConstraint(['policy_id'], ['policies.id'], ),
         sa.PrimaryKeyConstraint('id')
@@ -288,4 +287,4 @@ def downgrade() -> None:
     op.drop_table('customers')
     op.drop_index(op.f('ix_users_email'), table_name='users')
     op.drop_table('users')
-    op.execute("DROP EXTENSION IF EXISTS vector")
+    # op.execute("DROP EXTENSION IF EXISTS vector")

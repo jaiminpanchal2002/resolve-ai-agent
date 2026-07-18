@@ -2,13 +2,11 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from resolveai.agent.tools import (
+    create_escalation,
+    create_refund_request,
     get_customer,
     get_order,
-    get_payment,
     get_shipment,
-    search_policy,
-    create_refund_request,
-    create_escalation,
 )
 
 
@@ -34,17 +32,19 @@ async def test_agent_read_tools(seeded_db: AsyncSession):
 @pytest.mark.asyncio
 async def test_agent_write_tools(seeded_db: AsyncSession):
     # Test create_refund_request
-    refund_res = await create_refund_request(seeded_db, "ORD-9999", 82000.0, "Proof of delivery missing")
+    refund_res = await create_refund_request(
+        seeded_db, "ORD-9999", 82000.0, "Proof of delivery missing"
+    )
     assert refund_res["status"] == "SUCCESS"
     assert refund_res["amount"] == 82000.0
 
     # Test create_escalation
     esc_res = await create_escalation(
-        seeded_db, 
-        ticket_id="TKT-EVAL-TEST", 
-        agent_run_id="RUN-EVAL-TEST", 
-        queue_name="Logistics Queue", 
-        reason="Missing proof of delivery"
+        seeded_db,
+        ticket_id="TKT-EVAL-TEST",
+        agent_run_id="RUN-EVAL-TEST",
+        queue_name="Logistics Queue",
+        reason="Missing proof of delivery",
     )
     assert esc_res["status"] == "PENDING"
     assert esc_res["queue_name"] == "Logistics Queue"

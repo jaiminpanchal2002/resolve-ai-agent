@@ -1,12 +1,18 @@
 import logging
 import time
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest, Counter, Histogram
-from prometheus_client.multiprocess import MultiProcessCollector
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+)
 
-from resolveai.core.config import settings
 from resolveai.api.endpoints import router as api_router
+from resolveai.core.config import settings
 
 # Configure Logging
 logging.basicConfig(
@@ -23,9 +29,11 @@ app = FastAPI(
 )
 
 # CORS Configuration
+# Explicit origins: wildcard origins combined with credentials are rejected
+# by browsers per the CORS spec, so origins come from configuration.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust in production
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,17 +61,17 @@ async def prometheus_middleware(request: Request, call_next):
     start_time = time.perf_counter()
     method = request.method
     endpoint = request.url.path
-    
+
     response = await call_next(request)
-    
+
     duration = time.perf_counter() - start_time
     status_code = response.status_code
-    
+
     # Exclude metrics endpoint from scraping metrics
     if endpoint != "/metrics":
         REQUEST_COUNT.labels(method=method, endpoint=endpoint, http_status=status_code).inc()
         REQUEST_LATENCY.labels(method=method, endpoint=endpoint).observe(duration)
-        
+
     return response
 
 
@@ -71,6 +79,7 @@ async def prometheus_middleware(request: Request, call_next):
 async def metrics():
     """Prometheus metrics endpoint."""
     from fastapi.responses import Response
+
     data = generate_latest(registry)
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -83,15 +92,15 @@ app.include_router(api_router, prefix="/api")
 def setup_opentelemetry(app: FastAPI) -> None:
     try:
         from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.sdk.resources import Resource
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
         # Create resource configuration
         resource = Resource.create(attributes={"service.name": "resolveai-backend"})
-        
+
         # Configure Tracer provider and exporter
         provider = TracerProvider(resource=resource)
         processor = BatchSpanProcessor(
@@ -99,7 +108,7 @@ def setup_opentelemetry(app: FastAPI) -> None:
         )
         provider.add_span_processor(processor)
         trace.set_tracer_provider(provider)
-        
+
         # Instrument FastAPI app
         FastAPIInstrumentor.instrument_app(app)
         logger.info("OpenTelemetry successfully initialized.")

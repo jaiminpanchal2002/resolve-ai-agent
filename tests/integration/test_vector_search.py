@@ -1,5 +1,4 @@
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from resolveai.models.models import Policy, PolicyChunk
@@ -18,7 +17,7 @@ async def test_pgvector_cosine_distance_search(db_session: AsyncSession):
     # Vector A: [0.9] followed by [0.0]s
     emb_a = [0.0] * 1536
     emb_a[0] = 0.9
-    
+
     # Vector B: [0.1] followed by [0.0]s
     emb_b = [0.0] * 1536
     emb_b[0] = 0.1
@@ -27,26 +26,27 @@ async def test_pgvector_cosine_distance_search(db_session: AsyncSession):
         policy_id="POL-SHIPPING",
         content="Shipping rules state that items are delivered within five business days.",
         embedding=emb_a,
-        chunk_index=0
+        chunk_index=0,
     )
     chunk2 = PolicyChunk(
         policy_id="POL-BILLING",
         content="Billing rules state that refunds take 3-5 banking days to clear.",
         embedding=emb_b,
-        chunk_index=0
+        chunk_index=0,
     )
     db_session.add_all([chunk1, chunk2])
     await db_session.flush()
 
     # 2. Query closest to emb_a
     service = RetrievalService(db_session)
-    
+
     # We query with a vector closer to Vector A (e.g. [0.8] followed by 0.0s)
     query_emb = [0.0] * 1536
     query_emb[0] = 0.8
-    
+
     # Mock llm_provider.get_embedding to return query_emb
     import unittest.mock as mock
+
     service.provider.get_embedding = mock.AsyncMock(return_value=query_emb)
 
     results = await service.retrieve_semantic(query="dummy", limit=1)
