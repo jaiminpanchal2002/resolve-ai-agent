@@ -88,16 +88,29 @@ async def test_async_engine(postgres_container, test_sync_engine):
 
 
 # 4. Transaction-isolated database session fixture
+#
+# Canonical SQLAlchemy 2.0 "external transaction" pattern:
+# the session is bound to a Connection that already holds an outer
+# transaction, and join_transaction_mode="create_savepoint" makes every
+# session.commit() in application code release a SAVEPOINT instead of
+# committing for real. At teardown the outer transaction is rolled back,
+# so nothing a test (or the API endpoints it calls) writes can ever leak
+# into another test — even though endpoints call `await db.commit()`.
 @pytest_asyncio.fixture
 async def db_session(test_async_engine):
-    session_factory = async_sessionmaker(
-        bind=test_async_engine, expire_on_commit=False, autoflush=False
-    )
+    async with test_async_engine.connect() as conn:
+        outer_tx = await conn.begin()
+        session_factory = async_sessionmaker(
+            bind=conn,
+            expire_on_commit=False,
+            autoflush=False,
+            join_transaction_mode="create_savepoint",
+        )
+        async with session_factory() as session:
+            yield session
 
-    # Savepoint transaction: rolls back after the test completes
-    async with session_factory() as session, session.begin():
-        yield session
-        await session.rollback()
+        if outer_tx.is_active:
+            await outer_tx.rollback()
 
 
 # 5. Seeding helper fixtures for tools and integration tests
