@@ -59,8 +59,9 @@ def event_loop():
 def test_sync_engine(postgres_container):
     # Fetch connection details from container
     db_url = postgres_container.get_connection_url()
-    # Force psycopg driver for sync migrations / seeding
-    db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
+    # Force psycopg driver (v3) for sync migrations / seeding
+    if "://" in db_url:
+        db_url = "postgresql+psycopg://" + db_url.split("://", 1)[1]
     engine = create_engine(db_url)
 
     # Enable vector extension and create tables
@@ -78,7 +79,8 @@ def test_sync_engine(postgres_container):
 async def test_async_engine(postgres_container, test_sync_engine):
     db_url = postgres_container.get_connection_url()
     # Force asyncpg driver for async operations
-    db_url = db_url.replace("postgresql://", "postgresql+asyncpg://")
+    if "://" in db_url:
+        db_url = "postgresql+asyncpg://" + db_url.split("://", 1)[1]
 
     engine = create_async_engine(db_url)
     yield engine
