@@ -1,10 +1,10 @@
 import datetime
 from typing import Annotated
 
+import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,16 +12,28 @@ from resolveai.core.config import settings
 from resolveai.db.session import get_async_db
 from resolveai.models.models import User
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/token")
+
+# bcrypt only uses the first 72 bytes of a password. passlib used to truncate
+# silently; bcrypt>=5 raises instead, so we truncate explicitly to keep the
+# old behaviour (and compatibility with hashes created via passlib).
+_BCRYPT_MAX_BYTES = 72
+
+
+def _truncate(password: str) -> bytes:
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return bcrypt.checkpw(_truncate(plain_password), hashed_password.encode("utf-8"))
+    except ValueError:
+        # Malformed / non-bcrypt hash in the DB
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(_truncate(password), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: datetime.timedelta | None = None) -> str:

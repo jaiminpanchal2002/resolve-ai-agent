@@ -11,6 +11,7 @@ Design notes:
 import asyncio
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import Any, TypeVar
 
@@ -269,6 +270,10 @@ class FakeProvider(LLMProvider):
     ) -> tuple[str, int, int]:
         return "[FAKE LLM RESPONSE] Resolved customer inquiry.", 10, 15
 
+    # Deterministic tool playbook: walk through the standard fact-finding
+    # sequence, then finish. Order ids are read from the prompt itself.
+    _TOOL_SEQUENCE = ("get_customer", "get_order", "get_shipment", "search_policy")
+
     async def generate_structured(
         self,
         prompt: str,
@@ -276,8 +281,69 @@ class FakeProvider(LLMProvider):
         system_instruction: str | None = None,
         temperature: float = 0.0,
     ) -> tuple[T, int, int]:
-        data = self._mock_data_for_schema(response_model)
+        handler = {
+            "TicketClassification": self._mock_classification,
+            "LLMToolDecision": self._mock_tool_decision,
+            "LLMResolution": self._mock_resolution,
+        }.get(response_model.__name__)
+        data = handler(prompt) if handler else self._mock_data_for_schema(response_model)
         return response_model(**data), 10, 20
+
+    @staticmethod
+    def _mock_classification(prompt: str) -> dict[str, Any]:
+        """Keyword-based deterministic ticket classification."""
+        text = prompt.lower()
+        if any(k in text for k in ("deliver", "shipment", "package", "tracking", "received")):
+            category, intent = "DELIVERY_DISPUTE", "REPORT_MISSING_DELIVERY"
+        elif any(k in text for k in ("refund", "charge", "payment", "billed")):
+            category, intent = "PAYMENT_ISSUE", "CHARGE_DISPUTE"
+        elif any(k in text for k in ("password", "login", "locked", "account access")):
+            category, intent = "ACCOUNT_ACCESS", "RESET_PASSWORD"
+        elif any(k in text for k in ("subscription", "plan", "cancel")):
+            category, intent = "SUBSCRIPTION_CHANGE", "CANCEL_SUBSCRIPTION"
+        else:
+            category, intent = "AMBIGUOUS", "UNKNOWN"
+        return {
+            "category": category,
+            "severity": "HIGH",
+            "intent": intent,
+            "requires_account_data": True,
+        }
+
+    @classmethod
+    def _mock_tool_decision(cls, prompt: str) -> dict[str, Any]:
+        """Pick the next unexecuted tool from the playbook; DONE when finished."""
+        order_ids = re.findall(r"ORD-[A-Za-z0-9]+", prompt)
+        order_id = order_ids[0] if order_ids else None
+
+        for tool in cls._TOOL_SEQUENCE:
+            if f'"tool": "{tool}"' in prompt:
+                continue  # already executed (appears in tool_outputs JSON)
+            if tool in ("get_order", "get_shipment") and not order_id:
+                continue  # cannot call without an order id
+            tool_input: dict[str, Any] = {}
+            if tool in ("get_order", "get_shipment"):
+                tool_input = {"order_id": order_id}
+            elif tool == "search_policy":
+                tool_input = {"query": "delivery dispute and refund policy rules"}
+            return {"tool_name": tool, "tool_input": tool_input}
+        return {"tool_name": "DONE", "tool_input": {}}
+
+    @staticmethod
+    def _mock_resolution(prompt: str) -> dict[str, Any]:
+        """Escalate when facts look incomplete; cite any policies seen in context."""
+        evidence = sorted(set(re.findall(r"POL-[A-Za-z]+-[0-9]+", prompt)))
+        escalate = "Missing" in prompt or not evidence
+        return {
+            "resolution": "ESCALATE" if escalate else "RESOLVED",
+            "reason": (
+                "[FAKE LLM] Escalating: missing proof or no supporting policy found."
+                if escalate
+                else "[FAKE LLM] Facts and cited policies support resolution."
+            ),
+            "evidence": evidence,
+            "actions_taken": [],
+        }
 
     async def get_embedding(self, text: str) -> list[float]:
         # Deterministic but text-dependent so vector tests aren't degenerate.
