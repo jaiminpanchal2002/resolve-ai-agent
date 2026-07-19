@@ -75,7 +75,7 @@ def test_sync_engine(postgres_container):
     return engine
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture
 async def test_async_engine(postgres_container, test_sync_engine):
     db_url = postgres_container.get_connection_url()
     # Force asyncpg driver for async operations
